@@ -3,11 +3,10 @@ package main
 import (
 	"context"
 	"crypto/md5"
-	"encoding/hex"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -16,10 +15,11 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -30,22 +30,26 @@ type Profile struct {
 }
 
 var (
-	credFile       string
-	serverDir      string
-	sourceFile     string
-	destURI        string
-	recursiveFlag  bool
-	profiles       map[string]Profile
-	mainDirs       = []string{"incoming_tmp", "incoming", "processing", "failed", "completed"}
-	watcher        *fsnotify.Watcher
-	processingLock sync.Mutex
+	credFile        string
+	serverDir       string
+	sourceFile      string
+	destURI         string
+	recursiveFlag   bool
+	profiles        map[string]Profile
+	mainDirs        = []string{"incoming_tmp", "incoming", "processing", "failed", "completed"}
+	watcher         *fsnotify.Watcher
+	processingLock  sync.Mutex
+	maxRetries      = 10
+	initialBackoff  = 30 * time.Second
 	errNotImplemented = errors.New("HEAD request not supported")
+	db              *sql.DB
 )
 
 func main() {
 	parseFlags()
 	loadCredentials()
 	setupDirectories()
+	setupDatabase()
 
 	if serverDir != "" {
 		runServerMode()
@@ -98,6 +102,43 @@ func setupDirectories() {
 				os.MkdirAll(filepath.Join(serverDir, dir, profile), 0755)
 			}
 		}
+	}
+}
+
+func setupDatabase() {
+	var err error
+	db, err = sql.Open("sqlite3", "flood.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	createTable := `
+		CREATE TABLE IF NOT EXISTS file_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			profile TEXT,
+			bucket TEXT,
+			filepath TEXT,
+			retries INTEGER,
+			last_retry TIMESTAMP,
+			upload_outcome TEXT
+		);
+	`
+	_, err = db.Exec(createTable)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func logRetry(filePath, profileName, bucketName string, retries int, outcome string) {
+	stmt, err := db.Prepare("INSERT INTO file_records(profile, bucket, filepath, retries, last_retry, upload_outcome) VALUES (?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(profileName, bucketName, filePath, retries, time.Now(), outcome)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -185,16 +226,24 @@ func handleFileEvent(path string) {
 	os.Rename(path, processingPath)
 
 	// Process the file (upload to S3 etc.)
-	processFile(processingPath, profile, bucketName)
+	processFileWithRetry(processingPath, profile, bucketName, 0)
 }
 
-func processFile(path string, profile Profile, bucketName string) {
-	log.Printf("Uploading %s to S3 for profile %s and bucket %s\n", path, profile.Name, bucketName)
+func processFileWithRetry(path string, profile Profile, bucketName string, retryCount int) {
+	if retryCount > maxRetries {
+		log.Printf("Max retries reached for %s. Moving to failed directory.", path)
+		moveToFailed(path)
+		logRetry(path, profile.Name, bucketName, retryCount, "failure")
+		return
+	}
+
+	log.Printf("Uploading %s to S3 for profile %s and bucket %s. Retry attempt: %d\n", path, profile.Name, bucketName, retryCount)
 
 	err := validateBucketExists(profile, bucketName)
 	if err != nil {
 		log.Printf("Error: %v", err)
 		moveToFailed(path)
+		logRetry(path, profile.Name, bucketName, retryCount, "failure")
 		return
 	}
 
@@ -209,7 +258,16 @@ func processFile(path string, profile Profile, bucketName string) {
 	err = uploadToS3(path, bucketName, key, profile)
 	if err != nil {
 		log.Printf("Error uploading to S3: %v\n", err)
-		moveToFailed(path)
+		if isTransientError(err) {
+			// Retry with exponential backoff and jitter
+			backoffDuration := initialBackoff * time.Duration(1<<retryCount)
+			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+			time.Sleep(backoffDuration + jitter)
+			processFileWithRetry(path, profile, bucketName, retryCount+1)
+		} else {
+			moveToFailed(path)
+			logRetry(path, profile.Name, bucketName, retryCount, "failure")
+		}
 		return
 	}
 
@@ -217,6 +275,13 @@ func processFile(path string, profile Profile, bucketName string) {
 	completedPath := strings.Replace(path, "processing", "completed", 1)
 	os.MkdirAll(filepath.Dir(completedPath), 0755)
 	os.Rename(path, completedPath)
+	logRetry(path, profile.Name, bucketName, retryCount, "success")
+}
+
+func isTransientError(err error) bool {
+	return strings.Contains(err.Error(), "timeout") ||
+		strings.Contains(err.Error(), "connection reset") ||
+		strings.Contains(err.Error(), "DNS error")
 }
 
 func validateBucketExists(profile Profile, bucketName string) error {
