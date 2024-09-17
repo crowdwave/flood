@@ -1,26 +1,10 @@
-# flood
+### **Flood: Complete Program Requirements**
 
-Here is the updated requirements list with clarification that **the subdirectory directly underneath any profile name in the `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed` directories represents an S3 bucket name**.
-
----
-
-### Program Summary: **Flood**
-
-**Flood** is a dual-mode program designed to automate the transfer of files to S3-compatible cloud storage providers, specifically **Cloudflare** and **Backblaze**, via their S3 compatibility APIs. The program operates in two modes:
+**Flood** is a dual-mode program designed to automate the transfer of files to S3-compatible cloud storage providers, specifically **Cloudflare** and **Backblaze**, via their S3 compatibility APIs. It can operate in:
 - **Server mode**, where it continuously monitors directories for incoming files, processes them, and transfers them to the appropriate S3 buckets.
 - **Copy mode**, where it accepts individual files or directories and transfers them to a specified S3 URI.
 
-**Flood** ensures reliable file transfers using a staging system where files are first copied to a temporary location before being moved for processing and final transfer. It supports AWS-style profiles and bucket destinations, which are defined in a standard AWS credentials format. The program outputs detailed logs for every action it performs, including file movements and S3 uploads.
-
-#### Key Features:
-- **Dual-mode operation** (server mode or direct copy mode).
-- **Recursive file copying** for directories.
-- **Recursive directory watching** for incoming files.
-- **S3 URI-based profile and bucket targeting**.
-- **Profile and bucket validation** to ensure the correct configuration.
-- **Real-time monitoring** of file movements using `fsnotify`.
-- **Detailed logging** and output for every action.
-- **Golang AWS SDK** used for uploading files to S3.
+**Flood** dynamically manages bucket directories and ensures that files are only copied into existing buckets on the S3 server. The program outputs detailed logs for every action it performs, including file movements and S3 uploads.
 
 ---
 
@@ -34,8 +18,18 @@ Here is the updated requirements list with clarification that **the subdirectory
 5. For each profile, the program must ensure the creation of subdirectories under five main directories: `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed`.
 
 #### File Structure:
-6. The **subdirectory directly underneath any profile name** in the `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed` directories represents an **S3 bucket name**.
-7. Any subdirectory or file underneath the bucket directory represents a file to be copied to the target profile's corresponding S3 bucket.
+6. The **bucket name** is the second directory level under each profile in the main directories (`incoming_tmp`, `incoming`, `processing`, `failed`, and `completed`).
+   - Directory structure:
+     ```
+     /server_directory/{main_dir}/{profileName}/{bucketName}/...
+     ```
+   - Example:
+     ```
+     /server_directory/incoming/profile1/mybucket/file.txt
+     ```
+7. **Profile and bucket name derivation**:
+   - In **server mode**, the bucket name is derived from the directory path as the second level under each profile when processing files in directories like `incoming` and `processing`.
+   - In **copy mode**, the bucket name is extracted from the S3 URI (e.g., `s3://profile1/mybucket/file.txt`), where the second component (`mybucket`) is treated as the bucket name.
 
 #### Server Mode:
 8. The program must be able to run in **server mode** if a `server_directory` argument is provided.
@@ -57,28 +51,47 @@ Here is the updated requirements list with clarification that **the subdirectory
 22. In **copy mode**, the destination must be specified in the format: `s3://{profilename}/{bucketname}/filepath_or_name`.
 23. The program must extract the **profile** and **bucket** directly from the S3 URI.
 24. The program must **validate the profile** and **bucket** by checking the credentials file and the structure of the `incoming` and `incoming_tmp` directories.
-25. In **copy mode**, the program must support an **optional recursive copy** (using typical command-line syntax such as `-r` or `--recursive`).
+25. The program must dynamically create bucket directories (if they don't exist) during **copy mode** operations.
+   - The necessary bucket directory structure must be created in both `incoming_tmp` and `incoming` as needed.
+26. In **copy mode**, the program must support an **optional recursive copy** (using typical command-line syntax such as `-r` or `--recursive`).
     - If the recursive flag is used, it should copy directories and all their contents to `incoming_tmp`.
-26. After the file or directory is copied into `incoming_tmp`, it must be **moved** to the corresponding location in `incoming`.
-27. If a directory or file is copied, it must respect the profile and S3 bucket structure, meaning files are placed in the correct subdirectory based on the profile and bucket specified in the S3 URI.
+27. After the file or directory is copied into `incoming_tmp`, it must be **moved** to the corresponding location in `incoming`.
+28. If a directory or file is copied, it must respect the profile and S3 bucket structure, meaning files are placed in the correct subdirectory based on the profile and bucket specified in the S3 URI.
 
 #### Directory Handling:
-28. An `incoming_tmp` directory with the same subdirectory structure as `incoming` must be created, where files are initially copied.
-29. All new files must be first copied into the appropriate subdirectory of `incoming_tmp` for each profile and bucket.
-30. Once a file copy is complete in `incoming_tmp`, the file should be moved to the corresponding location in the `incoming` directory, which is monitored by `fsnotify`.
-31. When the program starts, it must first delete the **entire contents** of the `incoming_tmp` directory to ensure it is empty before continuing.
-32. After deleting the contents of `incoming_tmp`, the program must proceed with creating all required directories for profiles and buckets under `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed`.
+29. An `incoming_tmp` directory with the same subdirectory structure as `incoming` must be created, where files are initially copied.
+30. All new files must be first copied into the appropriate subdirectory of `incoming_tmp` for each profile and bucket.
+31. Once a file copy is complete in `incoming_tmp`, the file should be moved to the corresponding location in the `incoming` directory, which is monitored by `fsnotify`.
+32. When the program starts, it must first delete the **entire contents** of the `incoming_tmp` directory to ensure it is empty before continuing.
+33. After deleting the contents of `incoming_tmp`, the program must proceed with creating all required directories for profiles and buckets under `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed`.
 
 #### File Processing:
-33. Files are processed by **copying them to the target S3 profile** using the **Golang AWS SDK**.
-34. The program must ensure that the file is fully uploaded to the S3 bucket before moving it to the `completed` directory.
-35. If the S3 upload fails, the program must log the error and move the file to the `failed` directory for retry or manual intervention.
+34. Files are processed by **copying them to the target S3 profile** using the **Golang AWS SDK**.
+35. The program must ensure that the file is fully uploaded to the S3 bucket before moving it to the `completed` directory.
+36. If the S3 upload fails, the program must log the error and move the file to the `failed` directory for retry or manual intervention.
+
+#### Bucket Validation Against S3 Server:
+37. Before copying any files to a bucket, the program must **validate the existence of the bucket on the S3 server**.
+   - The program must:
+     1. Query the S3 server for a list of buckets using the AWS SDK's `ListBuckets` function.
+     2. Ensure that the bucket specified in the S3 URI (or derived from the directory structure) exists on the server.
+   - Example:
+     ```go
+     client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+     ```
+38. If the bucket does not exist on the S3 server, the program should:
+   - Log an error indicating that the bucket does not exist.
+   - Skip the operation for that specific bucket.
+   - Example:
+     ```
+     Error: Bucket 'mybucket' does not exist on S3 server.
+     ```
 
 #### Credentials Search:
-36. The program must search for the AWS credentials file using the **same algorithm** as the AWS CLI, before falling back to the file provided as an argument (see the AWS credentials search algorithm below).
+39. The program must search for the AWS credentials file using the **same algorithm** as the AWS CLI, before falling back to the file provided as an argument (see the AWS credentials search algorithm below).
 
 #### Logging and Output:
-37. The program must output **detailed logging** and **information** about each action it performs, including file movements, copying, and S3 uploads.
+40. The program must output **detailed logging** and **information** about each action it performs, including file movements, copying, and S3 uploads.
 
 ---
 
@@ -105,6 +118,23 @@ Here is the updated requirements list with clarification that **the subdirectory
 
 ---
 
-This finalizes the **Flood** program's requirements, ensuring that bucket names are appropriately structured under each profile, and detailing the file transfer process via S3. 
+### Example Flow:
+1. A user attempts to copy a file with the S3 URI `s3://profile1/mybucket/file.txt`.
+2. The program extracts `profile1` as the profile name and `mybucket` as the bucket name.
+3. The program queries the S3 server to ensure that `mybucket` exists for `profile1`.
+4. If the bucket exists:
+   - The file is first copied into `incoming_tmp/profile1/mybucket/`.
+  
 
-Let me know if you'd like to proceed with the Go code implementation!
+ - After the copy is complete, the file is moved to `incoming/profile1/mybucket/`.
+5. If the bucket does not exist:
+   - The program logs an error and skips the copy operation.
+
+---
+
+### Summary of Key Points:
+- The program dynamically manages the creation of bucket directories based on the S3 URI structure or directory structure.
+- **Bucket validation** is performed against the S3 server before any file copy operation to ensure that the bucket exists.
+- Detailed logging and error handling ensure that invalid operations are reported, and invalid buckets are skipped.
+
+Let me know if you'd like to proceed with the implementation or if any other clarifications are needed!
