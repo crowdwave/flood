@@ -1,10 +1,10 @@
-### **Flood: Complete Program Requirements**
+### **Flood: Complete Updated Program Requirements**
 
 **Flood** is a dual-mode program designed to automate the transfer of files to S3-compatible cloud storage providers, specifically **Cloudflare** and **Backblaze**, via their S3 compatibility APIs. It can operate in:
 - **Server mode**, where it continuously monitors directories for incoming files, processes them, and transfers them to the appropriate S3 buckets.
 - **Copy mode**, where it accepts individual files or directories and transfers them to a specified S3 URI.
 
-**Flood** dynamically manages bucket directories and ensures that files are only copied into existing buckets on the S3 server. The program outputs detailed logs for every action it performs, including file movements and S3 uploads.
+**Flood** dynamically manages bucket directories, validates the existence of buckets on the S3 server, and logs the progress of file transfers to an SQLite database for tracking.
 
 ---
 
@@ -14,7 +14,7 @@
 1. The program must accept a credentials file (with AWS credentials syntax) as an argument.
 2. It must parse the AWS credentials file and extract all profiles, including named profiles.
 3. It must validate the credentials file to ensure it has at least one profile.
-4. Each profile **must supply an AWS_ENDPOINT** and **AWS_REGION** (either directly or inherited via `source_profile`).
+4. **Each profile must supply an AWS_ENDPOINT and AWS_REGION**. If a profile is missing either value, the program must log an error and skip that profile.
 5. For each profile, the program must ensure the creation of subdirectories under five main directories: `incoming_tmp`, `incoming`, `processing`, `failed`, and `completed`.
 
 #### File Structure:
@@ -68,6 +68,7 @@
 #### File Processing:
 34. Files are processed by **copying them to the target S3 profile** using the **Golang AWS SDK**.
 35. The program must ensure that the file is fully uploaded to the S3 bucket before moving it to the `completed` directory.
+   - The check should be **informational only** if the target S3 service does not support `HEAD` requests.
 36. If the S3 upload fails, the program must log the error and move the file to the `failed` directory for retry or manual intervention.
 
 #### Bucket Validation Against S3 Server:
@@ -87,11 +88,26 @@
      Error: Bucket 'mybucket' does not exist on S3 server.
      ```
 
+#### SQLite Database Logging:
+39. The program must create an SQLite database in the current directory to track the state and progress of each file.
+40. The SQLite database must contain a table named `file_records` with the following fields:
+   - `id`: A unique identifier for each record (auto-incrementing primary key).
+   - `profile`: The profile name.
+   - `bucket`: The S3 bucket name.
+   - `filepath`: The relative file path within the bucket.
+   - `file_creation_date`: The file creation timestamp (to ensure a unique combination).
+   - `current_state`: The current state of the file (e.g., `incoming`, `processing`, `completed`, `failed`).
+   - `last_updated`: The timestamp when the state was last updated.
+   - `upload_outcome`: The outcome of the upload (`success`, `failure`).
+41. Each file should have a **unique record** in the database, determined by the `profile`, `bucket`, `filepath`, and **file creation date**.
+42. If a **file enters the system again** with the same `profile`, `bucket`, `filepath`, and creation date (indicating a re-upload or retry), the program must create a **new record** in the database.
+43. The program must update the database record **as the file moves through each state** (`incoming_tmp`, `incoming`, `processing`, `completed`, `failed`) and log the **outcome** (success or failure).
+
 #### Credentials Search:
-39. The program must search for the AWS credentials file using the **same algorithm** as the AWS CLI, before falling back to the file provided as an argument (see the AWS credentials search algorithm below).
+44. The program must search for the AWS credentials file using the **same algorithm** as the AWS CLI, before falling back to the file provided as an argument (see the AWS credentials search algorithm below).
 
 #### Logging and Output:
-40. The program must output **detailed logging** and **information** about each action it performs, including file movements, copying, and S3 uploads.
+45. The program must output **detailed logging** and **information** about each action it performs, including file movements, copying, and S3 uploads.
 
 ---
 
@@ -102,7 +118,9 @@
      - `AWS_ACCESS_KEY_ID`
      - `AWS_SECRET_ACCESS_KEY`
      - `AWS_SESSION_TOKEN` (if using temporary credentials)
-     - If these environment variables are set, they are used, and no further search occurs for the credentials file.
+     - If these environment variables are set, they are used,
+
+ and no further search occurs for the credentials file.
 
 2. **Shared Credentials File**:
    - If the environment variables are not set, the CLI looks for the credentials file in the **default location**:
@@ -124,17 +142,16 @@
 3. The program queries the S3 server to ensure that `mybucket` exists for `profile1`.
 4. If the bucket exists:
    - The file is first copied into `incoming_tmp/profile1/mybucket/`.
-  
-
- - After the copy is complete, the file is moved to `incoming/profile1/mybucket/`.
+   - After the copy is complete, the file is moved to `incoming/profile1/mybucket/`.
+   - As the file progresses, each state transition is logged in the SQLite database.
 5. If the bucket does not exist:
    - The program logs an error and skips the copy operation.
 
 ---
 
 ### Summary of Key Points:
-- The program dynamically manages the creation of bucket directories based on the S3 URI structure or directory structure.
 - **Bucket validation** is performed against the S3 server before any file copy operation to ensure that the bucket exists.
-- Detailed logging and error handling ensure that invalid operations are reported, and invalid buckets are skipped.
+- **SQLite database logging** tracks the state of each file as it moves through the system, ensuring each transfer attempt is uniquely logged.
+- The program outputs detailed logs and handles retries gracefully, ensuring accurate tracking and logging of file transfers and outcomes.
 
-Let me know if you'd like to proceed with the implementation or if any other clarifications are needed!
+Let me know if you'd like to proceed with the implementation of these requirements or if any other clarifications are needed!
