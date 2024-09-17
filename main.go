@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -75,7 +77,7 @@ func findCredentials() string {
 func loadCredentials() {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		log.Fatalf("unable to load AWS SDK config, %v", err)
+		log.Fatalf("Unable to load AWS SDK config: %v", err)
 	}
 
 	profiles = make(map[string]Profile)
@@ -168,39 +170,69 @@ func handleFileEvent(path string) {
 		return
 	}
 
-	profile, ok := profiles[parts[0]]
+	profileName := parts[0] // Profile
+	bucketName := parts[1]  // Bucket
+
+	profile, ok := profiles[profileName]
 	if !ok {
-		log.Printf("Unknown profile: %s", parts[0])
+		log.Printf("Unknown profile: %s", profileName)
 		return
 	}
 
-	processingPath := filepath.Join(serverDir, "processing", relativePath)
-	os.MkdirAll(filepath.Dir(processingPath), 0755)
+	// Create processing directory for the file
+	processingPath := filepath.Join(serverDir, "processing", profileName, bucketName)
+	os.MkdirAll(processingPath, 0755)
 	os.Rename(path, processingPath)
 
-	processFile(processingPath, profile)
+	// Process the file (upload to S3 etc.)
+	processFile(processingPath, profile, bucketName)
 }
 
-func processFile(path string, profile Profile) {
-	log.Printf("Uploading %s to S3 for profile %s\n", path, profile.Name)
+func processFile(path string, profile Profile, bucketName string) {
+	log.Printf("Uploading %s to S3 for profile %s and bucket %s\n", path, profile.Name, bucketName)
 
+	err := validateBucketExists(profile, bucketName)
+	if err != nil {
+		log.Printf("Error: %v", err)
+		moveToFailed(path)
+		return
+	}
+
+	// Simulate S3 upload
 	parts := strings.SplitN(path, string(os.PathSeparator), 4)
 	if len(parts) < 4 {
 		log.Println("Invalid path for S3 upload")
 		return
 	}
 
-	bucket, key := parts[2], parts[3]
-	err := uploadToS3(path, bucket, key, profile)
+	key := parts[3] // Object key (rest of the path after profile/bucket)
+	err = uploadToS3(path, bucketName, key, profile)
 	if err != nil {
 		log.Printf("Error uploading to S3: %v\n", err)
 		moveToFailed(path)
 		return
 	}
 
+	// Move to completed directory
 	completedPath := strings.Replace(path, "processing", "completed", 1)
 	os.MkdirAll(filepath.Dir(completedPath), 0755)
 	os.Rename(path, completedPath)
+}
+
+func validateBucketExists(profile Profile, bucketName string) error {
+	client := s3.NewFromConfig(getAWSConfig(profile))
+
+	resp, err := client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+	if err != nil {
+		return fmt.Errorf("failed to list buckets: %w", err)
+	}
+
+	for _, bucket := range resp.Buckets {
+		if *bucket.Name == bucketName {
+			return nil
+		}
+	}
+	return fmt.Errorf("bucket %s does not exist on S3 server", bucketName)
 }
 
 func processIncomingFiles() {
@@ -221,21 +253,31 @@ func runCopyMode() {
 		log.Fatal("Invalid S3 URI")
 	}
 
+	// Extract profile, bucket, and object key from S3 URI
 	profileName, bucketName, objectKey := parts[0], parts[1], parts[2]
 	profile, ok := profiles[profileName]
 	if !ok {
 		log.Fatalf("Unknown profile: %s", profileName)
 	}
 
+	// Ensure bucket exists on S3 server
+	err := validateBucketExists(profile, bucketName)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+
+	// Create the necessary bucket directory structure in incoming_tmp
 	tmpDir := filepath.Join(serverDir, "incoming_tmp", profileName, bucketName)
 	os.MkdirAll(tmpDir, 0755)
 
+	// Copy the source file or directory to incoming_tmp
 	if recursiveFlag && isDirectory(sourceFile) {
 		copyDirectory(sourceFile, filepath.Join(tmpDir, objectKey))
 	} else {
 		copyFile(sourceFile, filepath.Join(tmpDir, objectKey))
 	}
 
+	// Move files from incoming_tmp to incoming (bucket structure must also exist here)
 	moveToIncoming(tmpDir, profileName, bucketName)
 }
 
@@ -310,36 +352,13 @@ func moveToFailed(path string) {
 }
 
 func uploadToS3(file, bucket, key string, profile Profile) error {
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithRegion(profile.Region),
-		config.WithEndpointResolverWithOptions(
-			aws.EndpointResolverWithOptionsFunc(
-				func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-					return aws.Endpoint{URL: profile.Endpoint}, nil
-				},
-			),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to load configuration: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg)
+	client := s3.NewFromConfig(getAWSConfig(profile))
 
 	f, err := os.Open(file)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", file, err)
 	}
 	defer f.Close()
-
-	exists, err := checkFileExistsInS3(client, bucket, key)
-	if err != nil && !errors.Is(err, errNotImplemented) {
-		return fmt.Errorf("failed to check if file exists: %w", err)
-	}
-	if exists {
-		log.Printf("File %s already exists in bucket %s with key %s, skipping upload", file, bucket, key)
-		return nil
-	}
 
 	_, err = client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
@@ -353,45 +372,19 @@ func uploadToS3(file, bucket, key string, profile Profile) error {
 	return nil
 }
 
-func checkFileExistsInS3(client *s3.Client, bucket, key string) (bool, error) {
-	resp, err := client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
+func getAWSConfig(profile Profile) aws.Config {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(profile.Region),
+		config.WithEndpointResolverWithOptions(
+			aws.EndpointResolverWithOptionsFunc(
+				func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+					return aws.Endpoint{URL: profile.Endpoint}, nil
+				},
+			),
+		),
+	)
 	if err != nil {
-		var apiErr *types.NotImplemented
-		if errors.As(err, &apiErr) {
-			log.Println("HEAD request not supported by server, proceeding with upload")
-			return false, errNotImplemented
-		}
-		return false, fmt.Errorf("failed to perform HEAD request: %w", err)
+		log.Fatalf("failed to load configuration: %v", err)
 	}
-
-	etag := strings.Trim(resp.ETag, "\"")
-
-	fileMD5, err := computeMD5Hash(file)
-	if err != nil {
-		return false, fmt.Errorf("failed to compute MD5 hash of the file: %w", err)
-	}
-
-	if etag == fileMD5 {
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func computeMD5Hash(file string) (string, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return "", fmt.Errorf("failed to open file for MD5 computation: %w", err)
-	}
-	defer f.Close()
-
-	hasher := md5.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return "", fmt.Errorf("failed to hash file contents: %w", err)
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	return cfg
 }
